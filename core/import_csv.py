@@ -61,12 +61,13 @@ def _read_rows(path: Path, expected: set[str]):
         reader = csv.DictReader(stream, strict=True)
         try:
             headers = reader.fieldnames or []
+            columns = set(headers)
             duplicates = ", ".join(
                 sorted(name for name, count in Counter(headers).items() if count > 1)
             )
-            if duplicates or set(headers) != expected:
-                missing = ", ".join(sorted(expected - set(headers))) or "нет"
-                extra = ", ".join(sorted(set(headers) - expected)) or "нет"
+            if duplicates or columns != expected:
+                missing = ", ".join(sorted(expected - columns)) or "нет"
+                extra = ", ".join(sorted(columns - expected)) or "нет"
                 raise CSVImportError(
                     f"{path.name}: неверные заголовки; отсутствуют: {missing}; "
                     f"лишние: {extra}; повторяются: {duplicates or 'нет'}"
@@ -126,51 +127,60 @@ def _import_macros(session: Session, path: Path, batch_size: int) -> int:
 
 def _save_transactions(session: Session, batch: list[tuple]) -> int:
     keys = [(fingerprint, occurrence) for fingerprint, occurrence, _ in batch]
-    existing = set(
-        session.execute(
-            select(ImportedTransaction.fingerprint, ImportedTransaction.occurrence).where(
-                tuple_(ImportedTransaction.fingerprint, ImportedTransaction.occurrence).in_(keys)
-            )
-        ).all()
+    statement = select(ImportedTransaction.fingerprint, ImportedTransaction.occurrence).where(
+        tuple_(ImportedTransaction.fingerprint, ImportedTransaction.occurrence).in_(keys)
     )
-    pending = [item for item in batch if item[:2] not in existing]
+    existing = set(session.execute(statement))
+    pending = [
+        (fingerprint, occurrence, row)
+        for fingerprint, occurrence, row in batch
+        if (fingerprint, occurrence) not in existing
+    ]
     if not pending:
         return 0
+
     statement = insert(BuildingMaterialTransaction).returning(
         BuildingMaterialTransaction.id, sort_by_parameter_order=True
     )
-    identifiers = list(session.scalars(statement, [item[2] for item in pending]))
-    session.execute(
-        insert(ImportedTransaction),
-        [
-            {"fingerprint": fingerprint, "occurrence": occurrence, "transaction_id": identifier}
-            for (fingerprint, occurrence, _), identifier in zip(pending, identifiers)
-        ],
-    )
+    rows = [row for _, _, row in pending]
+    identifiers = list(session.scalars(statement, rows))
+    imported_rows = [
+        {"fingerprint": fingerprint, "occurrence": occurrence, "transaction_id": identifier}
+        for (fingerprint, occurrence, _), identifier in zip(pending, identifiers)
+    ]
+    session.execute(insert(ImportedTransaction), imported_rows)
     return len(pending)
+
+
+def _transaction_values(row: dict, macros: dict) -> dict:
+    inputs = {name: row[name] for name in TransactionInput.model_fields}
+    transaction = TransactionInput.model_validate(inputs)
+    values = transaction.to_row()
+
+    for name in ("year", "month", "week_of_year"):
+        if int(row[name]) != values[name]:
+            raise ValueError(f"{name} не соответствует дате")
+    if Decimal(row["revenue"]) != values["revenue"]:
+        raise ValueError("revenue не соответствует units × unit_price")
+
+    macro = macros.get(transaction.date)
+    if macro is None:
+        raise MissingMacroWeekError(transaction.date)
+    for name in MACRO_FIELDS:
+        number = Decimal(row[name])
+        expected = Decimal(str(getattr(macro, name)))
+        if not number.is_finite() or number != expected:
+            raise ValueError(f"{name} не совпадает с недельными показателями")
+    return values
 
 
 def _import_transactions(session: Session, path: Path, batch_size: int, stats: ImportStats) -> None:
     macros = {record.week: record for record in session.scalars(select(MacroDriverWeekly))}
     occurrences = Counter()
     batch = []
-    fields = set(TransactionInput.model_fields)
     for line, row in _read_rows(path, TRANSACTION_COLUMNS):
         try:
-            record = TransactionInput.model_validate({name: row[name] for name in fields})
-            values = record.to_row()
-            for name in ("year", "month", "week_of_year"):
-                if int(row[name]) != values[name]:
-                    raise ValueError(f"{name} не соответствует дате")
-            if Decimal(row["revenue"]) != values["revenue"]:
-                raise ValueError("revenue не соответствует units × unit_price")
-            macro = macros.get(record.date)
-            if macro is None:
-                raise MissingMacroWeekError(record.date)
-            for name in MACRO_FIELDS:
-                number = Decimal(row[name])
-                if not number.is_finite() or number != Decimal(str(getattr(macro, name))):
-                    raise ValueError(f"{name} не совпадает с недельными показателями")
+            values = _transaction_values(row, macros)
         except (ValueError, InvalidOperation) as error:
             raise _row_error(path, line, error) from error
 

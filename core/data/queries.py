@@ -93,7 +93,8 @@ def get_transaction(session: Session, transaction_id: int) -> Optional[BuildingM
     return session.scalars(statement).one_or_none()
 
 
-def _filter_conditions(filters: TransactionFilters) -> list[ColumnElement[bool]]:
+def _filter_conditions(filters: Optional[TransactionFilters]) -> list[ColumnElement[bool]]:
+    filters = filters or TransactionFilters()
     conditions = []
     if filters.date_from is not None:
         conditions.append(BuildingMaterialTransaction.date >= filters.date_from)
@@ -121,7 +122,7 @@ def list_transactions(
 
     statement = (
         select(BuildingMaterialTransaction)
-        .where(*_filter_conditions(filters or TransactionFilters()))
+        .where(*_filter_conditions(filters))
         .options(joinedload(BuildingMaterialTransaction.macro_week))
         .order_by(BuildingMaterialTransaction.date, BuildingMaterialTransaction.id)
         .limit(limit)
@@ -139,7 +140,7 @@ def aggregate_transactions(
         func.coalesce(func.sum(BuildingMaterialTransaction.revenue), Decimal("0.00")).label(
             "total_revenue"
         ),
-    ).where(*_filter_conditions(filters or TransactionFilters()))
+    ).where(*_filter_conditions(filters))
     row = session.execute(statement).one()
     return TransactionTotals(
         transaction_count=row.transaction_count,
